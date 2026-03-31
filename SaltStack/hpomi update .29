@@ -1,0 +1,145 @@
+# 📖 Incident & Engineering Log: SaltStack HPOmi Deployment & SSL Resolution
+---
+
+## 🎯 Objective
+Automate the deployment and upgrade of the HP Operations Agent (HPOmi) to version `12.29` across Windows server infrastructure using SaltStack. The payload is hosted on an internal corporate Nexus repository.
+
+## 🛑 The Core Issue: The OpenSSL Blockade
+During the initial deployment of the new payload using Salt's `archive.extracted` and `file.managed` states, the Minion failed to download the `.zip` archive, throwing the following Python traceback:
+
+`[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in certificate chain (_ssl.c:1125)`
+
+### The "Ghost" Success of the Previous Version
+The deployment state for the legacy version (`12.27`) was running without any SSL errors using identical syntax. This created a troubleshooting paradox: *Why does the same network allow the old payload but block the new one?*
+
+**SRE Investigation Steps:**
+1. **Local File Check:** Checked if the legacy file was manually placed in the target directory (`C:\salt\srv\localrepo\...`). It was not (`file.file_exists` returned `False`).
+2. **Network Isolation Test:** Forced the target server to perform a raw URL fetch bypassing the Salt State cache using:
+   `salt '[SERVER_HOSTNAME]' cp.get_url 'https://<INTERNAL_REPO_URL>/legacy_payload.zip' 'c:\temp\test_legacy.zip'`
+3. **The Revelation:** The raw fetch for the legacy payload **failed** with the exact same SSL error. 
+
+**Root Cause Analysis (Artifact Persistence):** The legacy version was only succeeding due to Salt's internal `minion_cache` (`C:\salt\var\cache\salt\minion\files\base\`). The file had been downloaded in the past (prior to strict SSL proxy rules being enforced). Salt's idempotent nature checked the cache, verified the SHA1 hash, and skipped the network layer entirely. The new version was a new file, forcing a fresh HTTPS handshake, which was intercepted and blocked by the strict Python OpenSSL context because it did not trust the internal enterprise CA.
+
+## 🛠️ The Resolution: Establishing the Chain of Trust
+Initial attempts to bypass the security using `skip_verify: True` in Salt or overriding the `[System.Net.ServicePointManager]` in PowerShell were actively blocked by the system's low-level socket enforcement.
+
+Instead of fighting the abstraction, we applied a structural SRE fix: establishing the **Chain of Trust** prior to execution.
+
+We utilized an existing enterprise state (`corp_module.windows.repocert`) designed to pull the internal `.pem`/`.cer` Root CA and inject it into the Windows Trusted Root Certification Authorities store, simultaneously syncing it with Salt's Python environment.
+
+### Implementing State Requisites
+To ensure the payload download never attempts an untrusted connection, we introduced Salt requisites (`include` and `require`).
+
+```jinja
+include:
+  - corp_module.windows.repocert
+
+std_hpomi_extract_hpomi_install_to_temp:
+  archive.extracted:
+    - name: '{{LOCAL_REPO_FOLDER}}'
+    - source: '{{REPO_ZIP_FILE}}'
+    - enforce_toplevel: False
+    - source_hash: sha1=[REDACTED_SHA1_HASH]
+    - require:
+      - sls: corp_module.windows.repocert
+
+🧹 Pre-Deployment: Surgical Uninstallation
+Upgrading enterprise middleware like HP Operations Agent requires a clean registry and service state. Over-installing often corrupts the core service or the local certificate database.
+
+The Challenge: The local uninstallation script (oainstall.vbs) was missing from the standard installation path.
+
+The Fix: Used a raw OS-level search to locate the dynamically placed binaries:
+salt '[SERVER_HOSTNAME]' cmd.run 'dir /s /b c:\oainstall.vbs'
+
+Resulted in finding the localized installer nested deep in the architecture:
+c:\Program Files\HP\HP BTO Software\bin\win64\OpC\install\oainstall.vbs
+
+Headless Execution:
+To execute the uninstallation on a remote, headless server, the script must be passed to cscript.exe (Console Based) rather than wscript.exe (GUI Based) to prevent the process from hanging while waiting for a user to click a hidden pop-up window.
+
+salt '[SERVER_HOSTNAME]' cmd.run 'cscript "c:\Program Files\HP\HP BTO Software\bin\win64\OpC\install\oainstall.vbs" -remove -agent'
+
+📜 Final Optimized Salt State (custom_hpomi_deploy.sls)
+
+{# Enterprise Middleware Deployment #}
+
+{% set tools_to_install = salt['pillar.get']('tools', ['hpomi_not_in_list']) %}
+
+{% from "corp_module/map.jinja" import LOCALREPO, os_family, standardconfcalled, logfile, dst_server %}
+{% from "corp_module/returnerprototype.jinja" import cust_returner_minion, returner_jobidinfo, time_when_executed %}
+
+{% set LOCAL_INSTALL_ZIP = 'c:\\salt\\srv\\localrepo\\hpomi\\OA_12.29_WIN64.zip' %} 
+{% set LOCAL_REPO_FOLDER = 'c:\\salt\\srv\\localrepo\\hpomi' %}
+{% set REPO_ZIP_FILE     = 'https://<INTERNAL_REPO_URL>/OA_12.29_WIN64.zip' %} 
+
+{% set version_output = salt['pkg.version']('HP Operation Agent Component') %}
+{% set version_parts = version_output.split('.') if version_output else ['0', '0'] %}
+{% set major_version = version_parts[0] | int %}
+{% set minor_version = version_parts[1] | int if version_parts|length > 1 else 0 %}
+{% set status_cert = salt['cmd.run']('ovcert -status') %}
+
+include:
+  - corp_module.windows.repocert
+
+{% if 'Windows' not in os_family %}
+std_hpomi-windows_only:
+  test.fail_without_changes:
+    - name: 'This state is for Windows Only'
+
+{% elif major_version >= 12 and minor_version >= 29 %}
+std_hpomi-OVCtrl-found:
+  test.succeed_without_changes:
+    - name: 'Core service found with target version, skipping.'
+
+{% else %}
+# Create cache folder
+std_hpomi_create_local_cache_folder:
+  file.directory:
+    - name: {{LOCAL_REPO_FOLDER}}
+    - makedirs: True
+
+# Download and Extract (Protected by SSL Requisite)
+std_hpomi_extract_hpomi_install_to_temp:
+  archive.extracted:
+    - name: '{{LOCAL_REPO_FOLDER}}'
+    - source: '{{REPO_ZIP_FILE}}'
+    - enforce_toplevel: False
+    - source_hash: sha1=[REDACTED_SHA1_HASH]
+    - require:
+      - sls: corp_module.windows.repocert
+
+# Modify VBS script for silent install
+std-modify_hpomi_install_script:
+  file.replace:
+    - name: '{{LOCAL_REPO_FOLDER}}\OA_12.29_WIN64\oa_inst_Win_OMI.vbs'
+    - pattern: WScript.StdIn.ReadLine
+    - repl: ''
+    - backup: '.bak'
+    - require:
+      - archive: std_hpomi_extract_hpomi_install_to_temp
+
+# Execute Installation
+std_hpomi_install_hpomi_agent:
+  cmd.run:
+    - name: 'cscript {{LOCAL_REPO_FOLDER}}\OA_12.29_WIN64\oa_inst_Win_OMI.vbs'
+    - require:
+      - file: std-modify_hpomi_install_script
+
+# Start Core Service
+std-start-hpomi-Ovctrl-service:
+  service.running:
+    - name: 'OvCtrl'
+    - enable: True
+    - start_type: auto
+    - require:
+      - cmd: std_hpomi_install_hpomi_agent
+
+# Certificate Verification & Timeout
+run_certreq_and_sleep:
+  cmd.run:
+    - name: 'ovcert -certreq || echo "Certificate request failed/skipped"; timeout /t 60'
+    - unless: "echo '{{ status_cert }}' | findstr /c:'Status: Certificate is installed.'"
+    - shell: cmd
+    - require:
+      - service: std-start-hpomi-Ovctrl-service
+{% endif %}
